@@ -141,10 +141,14 @@ class POutputDispatcher(PDispatcher):
             )
 
         if to_syslog:
-            loggers.handle_syslog(
-                self.normallog,
-                fmt=config.name + ' %(message)s'
+            fmt = "%(message)s"
+            priority = "notice" if channel == "stderr" else "info"
+            facility = getattr(config, '%s_syslog_facility' % channel, 'user')
+            priority = getattr(
+                config, '%s_syslog_priority' % channel, priority
             )
+            loggers.handle_syslog(self.normallog, fmt, tag=config.name,
+                                  facility=facility, priority=priority)
 
     def _init_capturelog(self):
         """

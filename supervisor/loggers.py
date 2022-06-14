@@ -10,22 +10,27 @@ idiosyncratic and a bit slow for our purposes (we don't use threads).
 import os
 import errno
 import sys
+import threading
 import time
 import traceback
+from logging.handlers import SYSLOG_UDP_PORT
+import socket
 
 from supervisor.compat import syslog
 from supervisor.compat import long
 from supervisor.compat import is_text_stream
 from supervisor.compat import as_string
 
+
 class LevelsByName:
-    CRIT = 50   # messages that probably require immediate user attention
-    ERRO = 40   # messages that indicate a potentially ignorable error condition
-    WARN = 30   # messages that indicate issues which aren't errors
-    INFO = 20   # normal informational output
-    DEBG = 10   # messages useful for users trying to debug configurations
-    TRAC = 5    # messages useful to developers trying to debug plugins
-    BLAT = 3    # messages useful for developers trying to debug supervisor
+    CRIT = 50  # messages that probably require immediate user attention
+    ERRO = 40  # messages that indicate a potentially ignorable error condition
+    WARN = 30  # messages that indicate issues which aren't errors
+    INFO = 20  # normal informational output
+    DEBG = 10  # messages useful for users trying to debug configurations
+    TRAC = 5  # messages useful to developers trying to debug plugins
+    BLAT = 3  # messages useful for developers trying to debug supervisor
+
 
 class LevelsByDescription:
     critical = LevelsByName.CRIT
@@ -36,6 +41,7 @@ class LevelsByDescription:
     trace = LevelsByName.TRAC
     blather = LevelsByName.BLAT
 
+
 def _levelNumbers():
     bynumber = {}
     for name, number in LevelsByName.__dict__.items():
@@ -43,13 +49,17 @@ def _levelNumbers():
             bynumber[number] = name
     return bynumber
 
+
 LOG_LEVELS_BY_NUM = _levelNumbers()
+
 
 def getLevelNumByDescription(description):
     num = getattr(LevelsByDescription, description, None)
     return num
 
+
 class Handler:
+    lock = None
     fmt = '%(message)s'
     level = LevelsByName.INFO
 
@@ -81,7 +91,7 @@ class Handler:
                     # but calling it may raise io.UnsupportedOperation
                     pass
                 else:
-                    if fd < 3: # don't ever close stdout or stderr
+                    if fd < 3:  # don't ever close stdout or stderr
                         return
             self.stream.close()
             self.closed = True
@@ -115,6 +125,7 @@ class Handler:
         traceback.print_exception(ei[0], ei[1], ei[2], None, sys.stderr)
         del ei
 
+
 class StreamHandler(Handler):
     def __init__(self, strm=None):
         Handler.__init__(self, strm)
@@ -125,6 +136,7 @@ class StreamHandler(Handler):
 
     def reopen(self):
         pass
+
 
 class BoundIO:
     def __init__(self, maxbytes, buf=b''):
@@ -148,6 +160,7 @@ class BoundIO:
 
     def clear(self):
         self.buf = b''
+
 
 class FileHandler(Handler):
     """File handler which supports reopening of logs.
@@ -185,8 +198,9 @@ class FileHandler(Handler):
             if why.args[0] != errno.ENOENT:
                 raise
 
+
 class RotatingFileHandler(FileHandler):
-    def __init__(self, filename, mode='ab', maxBytes=512*1024*1024,
+    def __init__(self, filename, mode='ab', maxBytes=512 * 1024 * 1024,
                  backupCount=10):
         """
         Open the specified file and use it as the stream for logging.
@@ -209,7 +223,7 @@ class RotatingFileHandler(FileHandler):
         If maxBytes is zero, rollover never occurs.
         """
         if maxBytes > 0:
-            mode = 'ab' # doesn't make sense otherwise!
+            mode = 'ab'  # doesn't make sense otherwise!
         FileHandler.__init__(self, filename, mode)
         self.maxBytes = maxBytes
         self.backupCount = backupCount
@@ -226,15 +240,15 @@ class RotatingFileHandler(FileHandler):
         FileHandler.emit(self, record)
         self.doRollover()
 
-    def _remove(self, fn): # pragma: no cover
+    def _remove(self, fn):  # pragma: no cover
         # this is here to service stubbing in unit tests
         return os.remove(fn)
 
-    def _rename(self, src, tgt): # pragma: no cover
+    def _rename(self, src, tgt):  # pragma: no cover
         # this is here to service stubbing in unit tests
         return os.rename(src, tgt)
 
-    def _exists(self, fn): # pragma: no cover
+    def _exists(self, fn):  # pragma: no cover
         # this is here to service stubbing in unit tests
         return os.path.exists(fn)
 
@@ -275,6 +289,7 @@ class RotatingFileHandler(FileHandler):
             self.removeAndRename(self.baseFilename, dfn)
         self.stream = open(self.baseFilename, 'wb')
 
+
 class LogRecord:
     def __init__(self, level, msg, **kw):
         self.level = level
@@ -292,9 +307,10 @@ class LogRecord:
             msg = as_string(self.msg)
             if self.kw:
                 msg = msg % self.kw
-            self.dictrepr = {'message':msg, 'levelname':levelname,
-                             'asctime':asctime}
+            self.dictrepr = {'message': msg, 'levelname': levelname,
+                             'asctime': asctime}
         return self.dictrepr
+
 
 class Logger:
     def __init__(self, level=None, handlers=None):
@@ -350,39 +366,281 @@ class Logger:
     def getvalue(self):
         raise NotImplementedError
 
+
+level_to_syslog = {
+    LevelsByName.CRIT: syslog.LOG_CRIT,
+    LevelsByName.ERRO: syslog.LOG_ERR,
+    LevelsByName.WARN: syslog.LOG_WARNING,
+    LevelsByName.INFO: syslog.LOG_NOTICE,
+    LevelsByName.DEBG: syslog.LOG_DEBUG,
+}
+
+
 class SyslogHandler(Handler):
-    def __init__(self):
+    LOG_EMERG = 0  # system is unusable
+    LOG_ALERT = 1  # action must be taken immediately
+    LOG_CRIT = 2  # critical conditions
+    LOG_ERR = 3  # error conditions
+    LOG_WARNING = 4  # warning conditions
+    LOG_NOTICE = 5  # normal but significant condition
+    LOG_INFO = 6  # informational
+    LOG_DEBUG = 7  # debug-level messages
+
+    #  facility codes
+    LOG_KERN = 0  # kernel messages
+    LOG_USER = 1  # random user-level messages
+    LOG_MAIL = 2  # mail system
+    LOG_DAEMON = 3  # system daemons
+    LOG_AUTH = 4  # security/authorization messages
+    LOG_SYSLOG = 5  # messages generated internally by syslogd
+    LOG_LPR = 6  # line printer subsystem
+    LOG_NEWS = 7  # network news subsystem
+    LOG_UUCP = 8  # UUCP subsystem
+    LOG_CRON = 9  # clock daemon
+    LOG_AUTHPRIV = 10  # security/authorization messages (private)
+    LOG_FTP = 11  # FTP daemon
+
+    #  other codes through 15 reserved for system use
+    LOG_LOCAL0 = 16  # reserved for local use
+    LOG_LOCAL1 = 17  # reserved for local use
+    LOG_LOCAL2 = 18  # reserved for local use
+    LOG_LOCAL3 = 19  # reserved for local use
+    LOG_LOCAL4 = 20  # reserved for local use
+    LOG_LOCAL5 = 21  # reserved for local use
+    LOG_LOCAL6 = 22  # reserved for local use
+    LOG_LOCAL7 = 23  # reserved for local use
+
+    priority_names = {
+        "alert": LOG_ALERT,
+        "crit": LOG_CRIT,
+        "critical": LOG_CRIT,
+        "debug": LOG_DEBUG,
+        "emerg": LOG_EMERG,
+        "err": LOG_ERR,
+        "error": LOG_ERR,  # DEPRECATED
+        "info": LOG_INFO,
+        "notice": LOG_NOTICE,
+        "panic": LOG_EMERG,  # DEPRECATED
+        "warn": LOG_WARNING,  # DEPRECATED
+        "warning": LOG_WARNING,
+    }
+
+    facility_names = {
+        "auth": LOG_AUTH,
+        "authpriv": LOG_AUTHPRIV,
+        "cron": LOG_CRON,
+        "daemon": LOG_DAEMON,
+        "ftp": LOG_FTP,
+        "kern": LOG_KERN,
+        "lpr": LOG_LPR,
+        "mail": LOG_MAIL,
+        "news": LOG_NEWS,
+        "security": LOG_AUTH,  # DEPRECATED
+        "syslog": LOG_SYSLOG,
+        "user": LOG_USER,
+        "uucp": LOG_UUCP,
+        "local0": LOG_LOCAL0,
+        "local1": LOG_LOCAL1,
+        "local2": LOG_LOCAL2,
+        "local3": LOG_LOCAL3,
+        "local4": LOG_LOCAL4,
+        "local5": LOG_LOCAL5,
+        "local6": LOG_LOCAL6,
+        "local7": LOG_LOCAL7,
+    }
+
+    # The map below appears to be trivially lowercasing the key. However,
+    # there's more to it than meets the eye - in some locales, lowercasing
+    # gives unexpected results. See SF #1524081: in the Turkish locale,
+    # "INFO".lower() != "info"
+    priority_map = {
+        "DEBUG": "debug",
+        "INFO": "info",
+        "WARNING": "warning",
+        "ERROR": "error",
+        "CRITICAL": "critical"
+    }
+
+    SYSLOG_UDP_PORT_UNPRVL = 1514
+
+    def __init__(self, tag=None, pid=False, facility="daemon", priority=None,
+                 address=('localhost', SYSLOG_UDP_PORT_UNPRVL), socktype=None):
         Handler.__init__(self)
-        assert syslog is not None, "Syslog module not present"
+        self.tag = tag or "supervisord"
+
+        def _int_string_or_none(val):
+            return val if isinstance(val, (int, type(None))) else (
+                getattr(syslog, "LOG_" + val.upper(), None)
+            )
+
+        self.address = address
+        self.socktype = socktype
+        self.priority = _int_string_or_none(priority)
+        self.facility = _int_string_or_none(facility)
+        self.options = syslog.LOG_PID if pid else 0
+        if isinstance(address, str):
+            self.unixsocket = True
+            # Syslog server may be unavailable during handler initialisation.
+            # C's openlog() function also ignores connection errors.
+            # Moreover, we ignore these errors while logging, so it not worse
+            # to ignore it also here.
+            try:
+                self._connect_unixsocket(address)
+            except OSError:
+                pass
+        else:
+            self.unixsocket = False
+            if socktype is None:
+                socktype = socket.SOCK_DGRAM
+            host, port = address
+            ress = socket.getaddrinfo(host, port, 0, socktype)
+            if not ress:
+                raise OSError("getaddrinfo returns an empty list")
+            for res in ress:
+                af, socktype, proto, _, sa = res
+                err = sock = None
+                try:
+                    sock = socket.socket(af, socktype, proto)
+                    if socktype == socket.SOCK_STREAM:
+                        sock.connect(sa)
+                    break
+                except OSError as exc:
+                    err = exc
+                    if sock is not None:
+                        sock.close()
+            if err is not None:
+                raise err
+            self.socket = sock
+            self.socktype = socktype
+
+    def _connect_unixsocket(self, address):
+        use_socktype = self.socktype
+        if use_socktype is None:
+            use_socktype = socket.SOCK_DGRAM
+        self.socket = socket.socket(socket.AF_UNIX, use_socktype)
+        try:
+            self.socket.connect(address)
+            # it worked, so set self.socktype to the used type
+            self.socktype = use_socktype
+        except OSError:
+            self.socket.close()
+            if self.socktype is not None:
+                # user didn't specify falling back, so fail
+                raise
+            use_socktype = socket.SOCK_STREAM
+            self.socket = socket.socket(socket.AF_UNIX, use_socktype)
+            try:
+                self.socket.connect(address)
+                # it worked, so set self.socktype to the used type
+                self.socktype = use_socktype
+            except OSError:
+                self.socket.close()
+                raise
+
+    def encodePriority(self, facility, priority):
+        """
+        Encode the facility and priority. You can pass in strings or
+        integers - if strings are passed, the facility_names and
+        priority_names mapping dictionaries are used to convert them to
+        integers.
+        """
+        if isinstance(facility, str):
+            facility = self.facility_names[facility]
+        if isinstance(priority, str):
+            priority = self.priority_names[priority]
+        return (facility << 3) | priority
+
+    def acquire(self):
+        """
+        Acquire the I/O thread lock.
+        """
+        if self.lock:
+            self.lock.acquire()
+
+    def release(self):
+        """
+        Release the I/O thread lock.
+        """
+        if self.lock:
+            self.lock.release()
 
     def close(self):
-        pass
+        """
+        Closes the socket.
+        """
+        self.acquire()
+        try:
+            self.socket.close()
+        finally:
+            self.release()
+            self.closed = True
+
+    def mapPriority(self, levelName):
+        """
+        Map a logging level name to a key in the priority_names map.
+        This is useful in two scenarios: when custom levels are being
+        used, and in the case where you can't do a straightforward
+        mapping by lowercasing the logging level name because of locale-
+        specific issues (see SF #1524081).
+        """
+        return self.priority_map.get(levelName, "warning")
+
+    append_nul = False  # some old syslog daemons expect a NUL terminator
 
     def reopen(self):
         pass
 
-    def _syslog(self, msg): # pragma: no cover
-        # this exists only for unit test stubbing
-        syslog.syslog(msg)
+    def _syslog(self, priority, msg):  # pragma: no cover
+        if self.tag:
+            msg = self.tag + ' ' + msg
+        if self.append_nul:
+            msg += '\000'
+        # We need to convert record level to lowercase, maybe this will
+        # change in the future.
+        prio = '<%d> ' % self.encodePriority(self.facility,
+                                             priority)
+        prio = prio.encode('utf-8')
+        # Message is a string. Convert to bytes as required by RFC 5424
+        msg = msg.encode('utf-8')
+        msg = prio + msg
+        if self.unixsocket:
+            try:
+                self.socket.send(msg)
+            except OSError:
+                self.socket.close()
+                self._connect_unixsocket(self.address)
+                self.socket.send(msg)
+        elif self.socktype == socket.SOCK_DGRAM:
+            self.socket.sendto(msg, self.address)
+        else:
+            self.socket.sendall(msg)
 
     def emit(self, record):
         try:
             params = record.asdict()
+            priority = self.priority or level_to_syslog.get(
+                record.level, syslog.LOG_WARNING
+            )
             message = params['message']
+
+            # syslog.openlog(self.tag, self.options, self.facility)
             for line in message.rstrip('\n').split('\n'):
                 params['message'] = line
                 msg = self.fmt % params
                 try:
-                    self._syslog(msg)
+                    self._syslog(priority, msg)
                 except UnicodeError:
-                    self._syslog(msg.encode("UTF-8"))
+                    self._syslog(priority, msg.encode("UTF-8"))
         except:
             self.handleError()
+
 
 def getLogger(level=None):
     return Logger(level)
 
-_2MB = 1<<21
+
+_2MB = 1 << 21
+
 
 def handle_boundIO(logger, fmt, maxbytes=_2MB):
     """Attach a new BoundIO handler to an existing Logger"""
@@ -393,6 +651,7 @@ def handle_boundIO(logger, fmt, maxbytes=_2MB):
     logger.addHandler(handler)
     logger.getvalue = io.getvalue
 
+
 def handle_stdout(logger, fmt):
     """Attach a new StreamHandler with stdout handler to an existing Logger"""
     handler = StreamHandler(sys.stdout)
@@ -400,17 +659,19 @@ def handle_stdout(logger, fmt):
     handler.setLevel(logger.level)
     logger.addHandler(handler)
 
-def handle_syslog(logger, fmt):
-    """Attach a new Syslog handler to an existing Logger"""
-    handler = SyslogHandler()
+
+def handle_syslog(logger, fmt, tag=None, show_pid=None, facility=None,
+                  priority=None):
+    handler = SyslogHandler(tag, show_pid, facility, priority)
     handler.setFormat(fmt)
     handler.setLevel(logger.level)
     logger.addHandler(handler)
 
+
 def handle_file(logger, filename, fmt, rotating=False, maxbytes=0, backups=0):
     """Attach a new file handler to an existing Logger. If the filename
     is the magic name of 'syslog' then make it a syslog handler instead."""
-    if filename == 'syslog': # TODO remove this
+    if filename == 'syslog':  # TODO remove this
         handler = SyslogHandler()
     else:
         if rotating is False:

@@ -49,6 +49,7 @@ from supervisor.datatypes import Automatic
 from supervisor.datatypes import Syslog
 from supervisor.datatypes import auto_restart
 from supervisor.datatypes import profile_options
+from supervisor.datatypes import syslog_target
 
 from supervisor import loggers
 from supervisor import states
@@ -445,6 +446,9 @@ class ServerOptions(Options):
     sockchmod = None
     logfile = None
     loglevel = None
+    syslog = None
+    syslog_facility = None
+    syslog_priority = None
     pidfile = None
     passwdfile = None
     nodaemon = None
@@ -469,6 +473,8 @@ class ServerOptions(Options):
                  existing_directory)
         self.add("logfile", "supervisord.logfile", "l:", "logfile=",
                  existing_dirpath, default="supervisord.log")
+        self.add("syslog", "supervisord.syslog", "L:", "syslog=",
+                 default="false")
         self.add("logfile_maxbytes", "supervisord.logfile_maxbytes",
                  "y:", "logfile_maxbytes=", byte_size,
                  default=50 * 1024 * 1024) # 50MB
@@ -542,10 +548,13 @@ class ServerOptions(Options):
         else:
             logfile = section.logfile
 
-        if logfile != 'syslog':
-            # if the value for logfile is "syslog", we don't want to
-            # normalize the path to something like $CWD/syslog.log, but
-            # instead use the syslog service.
+        if self.syslog or logfile == 'syslog':
+            import syslog
+            self.logfile = "syslog"
+            self.syslog = True
+            self.syslog_facility = section.syslog_facility
+            self.syslog_priority = section.syslog_priority
+        else:
             self.logfile = normalize_path(logfile)
 
         if self.pidfile:
@@ -649,6 +658,21 @@ class ServerOptions(Options):
 
         section.user = get('user', None)
         section.umask = octal_type(get('umask', '022'))
+        logfile = get('logfile', None)
+        try:
+            syslog = logfile == "syslog" or boolean(get('syslog', "false"))
+            if syslog:
+                section.syslog_facility, section.syslog_priority = (
+                    syslog_target("daemon")
+                )
+            section.syslog = syslog
+        except ValueError as e:
+            section.syslog_facility, section.syslog_priority = (
+                syslog_target(get('syslog', "daemon"))
+            )
+            section.syslog = (
+                True if section.syslog_facility is not None else False
+            )
         section.logfile = existing_dirpath(get('logfile', 'supervisord.log'))
         section.logfile_maxbytes = byte_size(get('logfile_maxbytes', '50MB'))
         section.logfile_backups = integer(get('logfile_backups', 10))
@@ -1003,6 +1027,18 @@ class ServerOptions(Options):
                 logfiles[mb_key] = maxbytes
 
                 sy_key = '%s_syslog' % k
+                sf_key = '%s_syslog_facility' % k
+                sp_key = '%s_syslog_priority' % k
+                try:
+                    syslog = boolean(get(section, sy_key, logfiles[lf_key] == "syslog"))
+                    from syslog import LOG_USER, LOG_NOTICE, LOG_INFO
+                    logfiles[sf_key] = LOG_USER
+                    logfiles[sp_key] = LOG_NOTICE if k == "stderr" else LOG_INFO
+                except ValueError:
+                    logfiles[sf_key], logfiles[sp_key] = syslog_target(
+                        get(section, sy_key, None)
+                    )
+                    syslog = True if logfiles[sf_key] is not None else False
                 syslog = boolean(get(section, sy_key, False))
                 logfiles[sy_key] = syslog
 
@@ -1054,12 +1090,16 @@ class ServerOptions(Options):
                 stdout_logfile_backups=logfiles['stdout_logfile_backups'],
                 stdout_logfile_maxbytes=logfiles['stdout_logfile_maxbytes'],
                 stdout_syslog=logfiles['stdout_syslog'],
+                stdout_syslog_facility=logfiles['stdout_syslog_facility'],
+                stdout_syslog_priority=logfiles['stdout_syslog_priority'],
                 stderr_logfile=logfiles['stderr_logfile'],
                 stderr_capture_maxbytes = stderr_cmaxbytes,
                 stderr_events_enabled = stderr_events,
                 stderr_logfile_backups=logfiles['stderr_logfile_backups'],
                 stderr_logfile_maxbytes=logfiles['stderr_logfile_maxbytes'],
                 stderr_syslog=logfiles['stderr_syslog'],
+                stderr_syslog_facility=logfiles['stderr_syslog_facility'],
+                stderr_syslog_priority=logfiles['stderr_syslog_priority'],
                 stopsignal=stopsignal,
                 stopwaitsecs=stopwaitsecs,
                 stopasgroup=stopasgroup,
@@ -1501,14 +1541,20 @@ class ServerOptions(Options):
         self.logger = loggers.getLogger(self.loglevel)
         if self.nodaemon and not self.silent:
             loggers.handle_stdout(self.logger, format)
-        loggers.handle_file(
-            self.logger,
-            self.logfile,
-            format,
-            rotating=not not self.logfile_maxbytes,
-            maxbytes=self.logfile_maxbytes,
-            backups=self.logfile_backups,
-        )
+        if self.syslog or self.logfile == "syslog":
+            loggers.handle_syslog(self.logger, '%(message)s',
+                                  tag="supervisord", show_pid=True,
+                                  facility=self.syslog_facility,
+                                  priority=self.syslog_priority)
+        else:
+            loggers.handle_file(
+                self.logger,
+                self.logfile,
+                format,
+                rotating=not not self.logfile_maxbytes,
+                maxbytes=self.logfile_maxbytes,
+                backups=self.logfile_backups,
+            )
         self._log_parsing_messages(self.logger)
 
     def make_http_servers(self, supervisord):
@@ -1888,7 +1934,11 @@ class ProcessConfig(Config):
         'stderr_events_enabled', 'stderr_syslog',
         'stopsignal', 'stopwaitsecs', 'stopasgroup', 'killasgroup',
         'exitcodes', 'redirect_stderr' ]
-    optional_param_names = [ 'environment', 'serverurl' ]
+    optional_param_names = [
+        'environment', 'serverurl',
+        'stdout_syslog_facility', 'stdout_syslog_priority',
+        'stderr_syslog_facility', 'stderr_syslog_priority',
+    ]
 
     def __init__(self, options, **params):
         self.options = options
